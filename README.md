@@ -2,114 +2,127 @@
 
 ## Overview
 
-This project implements a custom 8086 processor core and System-on-Chip (SoC) using Verilog HDL. It integrates instruction execution, memory interfaces, cache and TLB control, peripheral IP controllers, and hardware interrupt handling.
+This project focuses on developing a custom 8086 processor core and System-on-Chip (SoC) using Verilog HDL. The system integrates instruction execution, cache and TLB control, memory interfaces, peripheral IP controllers, and hardware interrupt handling.
 
-The project includes assembly-based firmware designed to initialize the processor, configure interrupt handling, trigger peripheral operations, and verify burst memory transfers.
+The project includes custom assembly firmware designed to initialize the processor, configure interrupt handling, execute sequential peripheral operations, and service hardware interrupts through an Interrupt Service Routine (ISR).
 
 ## Key Features
 
-- Custom 8086 processor core implemented in Verilog HDL.
+- Custom 8086 processor core using Verilog HDL.
 - Arithmetic Logic Unit (ALU).
 - Execution Unit (EU) and Bus Interface Unit (BIU).
 - Instruction prefetch queue.
 - L1 cache and Instruction Tightly Coupled Memory (ITCM).
 - Dual-clock main memory.
 - Peripheral IP controllers.
-- Programmable interrupt controller (PIC) interface.
-- Hardware interrupt handling.
+- Memory-mapped I/O (MMIO) access.
+- Cache and TLB control.
+- Programmable Interrupt Controller (PIC) interface.
+- Hardware interrupt servicing and acknowledgment.
 - Clock-gating and clock-domain synchronization logic.
-- Assembly firmware and custom instruction encoding.
-- System-level simulation using a SystemVerilog testbench.
-- FSDB waveform support for debugging with compatible Synopsys tools.
+- Custom assembly firmware and instruction encoding.
+- System-level verification using SystemVerilog and compatible Synopsys tools.
 
-## Project Structure
+## Assembly Firmware: Sequential Hardware Burst Test
 
-| File | Description |
-|---|---|
-| `custom_8086_core.v` | Processor core integration |
-| `alu.v` | Arithmetic and logic operations |
-| `execution_unit.v` | Instruction execution |
-| `bus_interface_unit.v` | Instruction fetching and bus transactions |
-| `prefetch_queue.v` | Instruction prefetch buffering |
-| `l1_cache.v` | L1 cache logic |
-| `itcm.v` | Instruction tightly coupled memory |
-| `dual_clock_main_memory.v` | Dual-clock main memory |
-| `ip_controller.v` | Peripheral IP controller logic |
-| `pointer_sync.v` | Synchronization logic |
-| `icg_cell.v` | Clock-gating logic or model |
-| `soc_top.v` | Top-level SoC integration, if present |
-| `tb_custom_8086_core.sv` | System-level verification testbench |
-| `assembler.pl` | Assembly-to-firmware conversion script |
-| `firmware1.hex` | Generated firmware image |
+The firmware initializes the processor and peripheral controllers, configures the PIC, and starts IP1, IP2, and IP3 sequentially.
 
-*Update this table to match the exact filenames in the repository.*
+### 1. System Initialization and Boot Sequence
 
-## Assembly Firmware: Burst and Interrupt Verification
+The firmware performs the following steps:
 
-The current assembly test focuses on processor initialization, peripheral interrupt configuration, and a 64-word burst operation initiated by IP1.
+1. Loads `0003` into AX and writes AX to CR0 to enable the intended cache and TLB configuration.
+2. Writes `0008` to the IP1, IP2, and IP3 registers at addresses `0x8080`, `0x9080`, and `0xA080` to clear their boot-reset flags, according to the intended controller register semantics.
+3. Writes `0007` to the PIC acknowledgment register at `0x7004` to clear pending interrupt status, according to the PIC implementation.
+4. Writes `0007` to `0x7002` to unmask IP1, IP2, and IP3.
+5. Writes `0001` to `0x7006` to enable the global PIC function.
+6. Executes `STI` to enable maskable hardware interrupts.
 
-### Test Sequence
+### 2. Sequential IP Operation
 
-1. **Processor initialization:** Load `0003` into AX and move it to CR0 to enable the intended cache and TLB configuration.
-2. **Interrupt configuration:** Write `0007` to address `7002` to unmask IP1, IP2, and IP3.
-3. **Global interrupt enable:** Write `0001` to address `7006` to enable the intended PIC functionality.
-4. **Enable CPU interrupts:** Execute `STI` so the processor can accept maskable hardware interrupts.
-5. **Start IP1:** Execute `TRIG_IP1` to initiate the intended 64-word burst operation.
-6. **Allow background execution:** Execute NOP instructions while the controller performs its memory writes.
-7. **Interrupt verification:** Check that the expected hardware interrupt is received and handled correctly during the burst operation.
+The main program triggers each peripheral in sequence.
 
-The intended behavior is for IP1 to write 64 words while the processor continues executing instructions, with an interrupt occurring during the operation. The timing and interrupt behavior must be confirmed through simulation.
+- **IP1:** `TRIG_IP1` starts IP1. The following `HLT` is intended to suspend CPU instruction execution until an interrupt wakes the processor.
+- **IP2:** After the IP1 interrupt has been serviced and the interrupted program resumes, `TRIG_IP2` starts IP2. The next `HLT` waits for its interrupt.
+- **IP3:** After IP2 completes and its interrupt is serviced, `TRIG_IP3` starts IP3. The following `HLT` waits for the next interrupt.
+- **Final halt:** A final `HLT` is intended to stop normal program execution after all three operations.
 
-### Intended Memory-Mapped Control Registers
+This test is intended to demonstrate sequential peripheral activation and interrupt-driven processor wake-up rather than relying on a fixed number of NOP instructions for timing.
+
+### 3. Interrupt Service Routine (ISR)
+
+The assembly places the ISR and its handler blocks using `.ORG` directives.
+
+The ISR is intended to:
+
+1. Read the PIC interrupt status from address `0x7000`.
+2. Write the status value to `0x7004` to acknowledge the interrupt.
+3. Compare the status against `0001`, `0002`, and `0004`, representing the intended IP1, IP2, and IP3 interrupt masks.
+4. Jump to the corresponding IP handler.
+5. Write `000F` to the appropriate IP register to clear that IP's flag, according to the intended register semantics.
+6. Jump to the shared exit block.
+7. Execute `STI` and `IRET` to return from the interrupt.
+
+An `IRET` fallback is included for status values that do not match any of the three individual IP masks.
+
+### Intended Memory-Mapped Register Map
 
 | Address | Intended purpose |
 |---|---|
-| `0x7002` | IP1, IP2, and IP3 interrupt-unmask configuration |
-| `0x7006` | Global PIC enable register |
+| `0x7000` | PIC interrupt status |
+| `0x7002` | IP interrupt mask/unmask configuration |
+| `0x7004` | PIC interrupt acknowledgment |
+| `0x7006` | Global PIC enable |
+| `0x8080` | IP1 boot/reset flag register |
+| `0x9080` | IP2 boot/reset flag register |
+| `0xA080` | IP3 boot/reset flag register |
 
-These addresses and their write semantics should be verified against the actual SoC address decoder and peripheral implementation.
+The register meanings and write-one-to-clear behavior must be confirmed against the actual SoC and IP-controller RTL.
 
 ## Firmware Generation
 
-The project uses a Perl-based assembler to convert supported assembly instructions into the firmware image `firmware1.hex`.
+The project uses a Perl-based assembler to generate a hexadecimal firmware image.
 
-Generate the firmware using the command supported by your assembler script:
+Example:
 
 ```bash
 perl assembler.pl your_assembly_file.asm
 ```
 
-Ensure that the assembler supports the instructions used by the test, including `MOV`, `MOV CR0, AX`, `STI`, `TRIG_IP1`, and `NOP`.
+The generated firmware must use the filename and location expected by the simulation testbench, such as `firmware1.hex`.
 
-The custom instruction encodings must match the processor's instruction decoder and execution logic. Confirm the output byte ordering and ROM loading format before simulation.
+The assembler must support the custom instructions used by this firmware, including:
 
-## Verification Environment
+- `MOV`
+- `MOV CR0, AX`
+- `STI`
+- `HLT`
+- `TRIG_IP1`
+- `TRIG_IP2`
+- `TRIG_IP3`
+- `CMP`
+- `JE`
+- `JMP`
+- `IRET`
+- `.ORG`
 
-The project includes a SystemVerilog testbench for integrating and verifying the processor and SoC.
+The generated instruction encodings, memory byte ordering, interrupt-vector convention, and address calculations must match the processor implementation.
 
-The verification environment is intended to test:
+## Verification Strategy
 
-- Processor initialization and control-register configuration.
-- Cache and TLB configuration.
-- Interrupt-mask and PIC-enable writes.
-- IP1 burst triggering.
-- Main-memory writes and expected data values.
-- Hardware interrupt generation and handling.
-- Processor execution while the peripheral performs its burst operation.
+The firmware is intended to verify:
 
-FSDB waveforms can be used to inspect processor control signals, interrupt requests, controller state transitions, memory write transactions, and completion status when supported by the selected Synopsys simulation environment.
+- Processor cache and TLB initialization.
+- IP boot/reset flag clearing.
+- PIC acknowledgment and interrupt configuration.
+- Sequential triggering of IP1, IP2, and IP3.
+- CPU halt and interrupt-driven wake-up.
+- Interrupt-status decoding in the ISR.
+- Per-IP handler selection.
+- Controller flag clearing.
+- Interrupt return and continuation of the main program.
 
-## Simulation Procedure
-
-1. Compile all required Verilog and SystemVerilog source files.
-2. Generate `firmware1.hex` using the assembler.
-3. Confirm that the testbench loads the firmware from the expected path.
-4. Run the system-level simulation.
-5. Inspect the simulation log for assertion failures or data mismatches.
-6. Examine FSDB waveforms to verify the 64-word burst and interrupt timing.
-7. Confirm that the test reports success only when all expected conditions pass.
-
-A successful firmware build does not alone establish functional correctness. Report verification results based on the completed simulation and its checks.
+Simulation logs and FSDB waveforms can be used to inspect CPU execution, interrupt requests, PIC status, controller activity, and memory-mapped register writes.
 
 ## Tools and Technologies
 
@@ -122,14 +135,18 @@ A successful firmware build does not alone establish functional correctness. Rep
 
 ## Development Goals
 
-- Verify the custom instruction set and firmware encoding.
-- Validate cache and TLB control behavior.
-- Verify interrupt masking and PIC enable logic.
-- Confirm correct execution of IP1's 64-word burst operation.
-- Verify interrupt timing and handling during peripheral activity.
-- Improve testbench assertions and pass/fail reporting.
-- Maintain consistency between RTL, firmware, and verification results.
+- Maintain consistency between firmware encodings and RTL instruction decoding.
+- Validate memory-mapped peripheral access.
+- Verify PIC interrupt generation and acknowledgment.
+- Confirm sequential IP execution.
+- Validate ISR dispatch and return behavior.
+- Verify correct handling of boot/reset flags.
+- Improve testbench assertions and simulation reporting.
+
+## Verification Status
+
+This firmware describes the intended test scenarios. Successful execution, correct interrupt sequencing, and proper controller flag clearing must be confirmed by simulation before marking the tests as passing.
 
 ## Author
 
-Custom processor-core and SoC development project using Verilog HDL.
+Custom 8086 processor core and SoC development project using Verilog HDL.
