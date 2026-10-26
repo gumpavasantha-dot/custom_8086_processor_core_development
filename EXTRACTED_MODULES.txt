@@ -37,7 +37,20 @@ module alu #(parameter DATA_W = 16)(
     end
 endmodule
 
-
+/ ============================================================================
+// FIXED MODULE B: Asynchronous FIFO (Gray-Code Pointers)
+// ============================================================================
+module async_fifo #(parameter DATA_W = 16, parameter ADDR_W = 4)(
+    input  wire              wclk, wrst, winc,
+    input  wire [DATA_W-1:0] wdata,
+    output wire              wfull,
+    
+    input  wire              rclk, rrst, rinc,
+    output wire [DATA_W-1:0] rdata,
+    output wire              rempty
+);
+    localparam DEPTH = 1 << ADDR_W;
+    reg [DATA_W-1:0] mem [0:DEPTH-1];
     reg [ADDR_W:0] wbin, wgray, rbin, rgray;
     
     reg wfull_reg;
