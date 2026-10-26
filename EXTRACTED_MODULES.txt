@@ -17,3 +17,1029 @@ Extracted module blocks from supplied my_project.txt (no logic edits made):
 - pointer_sync: 17 lines
 - system_controller: 37 lines
 - tlb_array: 35 lines
+// ============================================================================
+// MODULE 1: Arithmetic Logic Unit (ALU)
+// ============================================================================
+module alu #(parameter DATA_W = 16)(
+    input  wire [DATA_W-1:0] op_a, input  wire [DATA_W-1:0] op_b,
+    input  wire [2:0]        alu_ctrl, output reg  [DATA_W-1:0] result
+);
+    localparam ALU_ADD = 3'b000, ALU_SUB = 3'b001, ALU_AND = 3'b010, ALU_OR = 3'b011, ALU_PASS = 3'b100;
+    always @(*) begin
+        case (alu_ctrl)
+            ALU_ADD:  result = op_a + op_b;
+            ALU_SUB:  result = op_a - op_b;
+            ALU_AND:  result = op_a & op_b;
+            ALU_OR:   result = op_a | op_b;
+            ALU_PASS: result = op_b;
+            default:  result = {DATA_W{1'b0}};
+        endcase
+    end
+endmodule
+
+
+    reg [ADDR_W:0] wbin, wgray, rbin, rgray;
+    
+    reg wfull_reg;
+    reg rempty_reg;
+
+    wire [ADDR_W:0] wptr_sync, rptr_sync;
+
+    pointer_sync #(.ADDR_W(ADDR_W)) sync_w2r (.clk(rclk), .rst(rrst), .ptr_in(wgray), .ptr_out(wptr_sync));
+    pointer_sync #(.ADDR_W(ADDR_W)) sync_r2w (.clk(wclk), .rst(wrst), .ptr_in(rgray), .ptr_out(rptr_sync));
+
+    // ---------------------------------------------------------
+    // WRITE DOMAIN (Fixed Combinational Loop)
+    // ---------------------------------------------------------
+    wire [ADDR_W:0] wbin_next  = wbin + winc; // Loop broken here
+    wire [ADDR_W:0] wgray_next = (wbin_next >> 1) ^ wbin_next;
+    wire wfull_val = (wgray_next == {~rptr_sync[ADDR_W:ADDR_W-1], rptr_sync[ADDR_W-2:0]});
+
+    always @(posedge wclk) begin
+        if (wrst) begin 
+            wbin <= 0; 
+            wgray <= 0; 
+            wfull_reg <= 0; 
+        end else begin
+            wbin <= wbin_next; 
+            wgray <= wgray_next;
+            wfull_reg <= wfull_val;
+            // Only write to memory if the registered full flag is 0
+            if (winc && !wfull_reg) mem[wbin[ADDR_W-1:0]] <= wdata;
+        end
+    end
+    assign wfull = wfull_reg;
+    
+    // ---------------------------------------------------------
+    // READ DOMAIN (Fixed Combinational Loop)
+    // ---------------------------------------------------------
+    wire [ADDR_W:0] rbin_next  = rbin + rinc; // Loop broken here
+    wire [ADDR_W:0] rgray_next = (rbin_next >> 1) ^ rbin_next;
+    wire rempty_val = (rgray_next == wptr_sync);
+
+    always @(posedge rclk) begin
+        if (rrst) begin 
+            rbin <= 0; 
+            rgray <= 0; 
+            rempty_reg <= 1'b1; // FIFO starts completely empty
+        end else begin 
+            rbin <= rbin_next; 
+            rgray <= rgray_next; 
+            rempty_reg <= rempty_val;
+        end
+    end
+    assign rdata = mem[rbin[ADDR_W-1:0]];
+    assign rempty = rempty_reg;
+    
+endmodule
+
+
+// ============================================================================
+// MODULE 6: Bus Interface Unit (BIU) - Unified Fetch Manager
+// ============================================================================
+module bus_interface_unit #(parameter V_ADDR = 16, parameter P_ADDR = 20, parameter D_W = 16)(
+    input  wire              clk, rst, 
+    output wire              q_empty, output wire [7:0] q_dout, input  wire q_pop,
+    input  wire [V_ADDR-1:0] eu_d_addr, input  wire [D_W-1:0] eu_d_wdata,
+    input  wire              eu_d_req, input  wire eu_d_we,
+    output wire [D_W-1:0]    eu_d_rdata, output reg eu_d_rdy,
+    input  wire              cache_en_i, input wire tlb_en_i,
+    input  wire              tlb_wr_en, input  wire [11:0] tlb_wr_v_tag, input  wire [15:0] tlb_wr_p_tag,
+    output reg  [P_ADDR-1:0] wb_adr_o, output reg  [D_W-1:0] wb_dat_o, input  wire [D_W-1:0] wb_dat_i,
+    output reg               wb_we_o, output reg wb_stb_o, output reg wb_cyc_o, input  wire wb_ack_i,
+    input  wire              branch_en, input  wire [15:0] branch_addr
+);
+    reg [V_ADDR-1:0] ip; wire q_full;
+    wire [15:0] i_p_frame, d_p_frame;
+    wire i_tlb_hit, i_tlb_miss, d_tlb_hit, d_tlb_miss;
+
+    wire [15:0] itcm_word;
+    itcm internal_rom (.ip_addr(ip), .instruction(itcm_word));
+    wire [7:0] itcm_byte = ip[0] ? itcm_word[15:8] : itcm_word[7:0];
+    
+    wire fetch_from_itcm = (ip < 16'h0800);
+    wire fetch_from_mem  = !fetch_from_itcm;
+    
+    tlb_array #(.V_TAG_W(12), .P_TAG_W(16), .ENTRIES(8)) itlb (
+        .clk(clk), .rst(rst), .req(!q_full & tlb_en_i & fetch_from_mem), .v_tag(ip[15:4]), 
+        .p_tag(i_p_frame), .hit(i_tlb_hit), .miss(i_tlb_miss),
+        .wr_en(tlb_wr_en), .wr_v_tag(tlb_wr_v_tag), .wr_p_tag(tlb_wr_p_tag)
+    );
+
+    tlb_array #(.V_TAG_W(12), .P_TAG_W(16), .ENTRIES(8)) dtlb (
+        .clk(clk), .rst(rst), .req(eu_d_req & tlb_en_i), .v_tag(eu_d_addr[15:4]), 
+        .p_tag(d_p_frame), .hit(d_tlb_hit), .miss(d_tlb_miss),
+        .wr_en(tlb_wr_en), .wr_v_tag(tlb_wr_v_tag), .wr_p_tag(tlb_wr_p_tag)
+    );
+
+    wire [P_ADDR-1:0] i_p_addr = tlb_en_i ? {i_p_frame, ip[3:0]} : {4'h0, ip}; 
+    wire [P_ADDR-1:0] d_p_addr = tlb_en_i ? {d_p_frame, eu_d_addr[3:0]} : {4'h0, eu_d_addr};
+
+    wire i_is_cacheable = (i_p_addr[19:16] == 4'h0) && cache_en_i && fetch_from_mem;
+    wire d_is_cacheable = (d_p_addr[19:16] == 4'h0) && cache_en_i;
+
+    localparam S_IDLE = 3'd0, S_BURST = 3'd1, S_COMMIT = 3'd2, S_WRITE = 3'd3, S_UNCACHEABLE_RD = 3'd4, S_UNCACHEABLE_FETCH = 3'd5; 
+    reg [2:0] state; reg [2:0] beat_cnt; reg [127:0] line_buf;
+    reg [19:0] base_addr; reg filling_dcache;
+
+    wire i_cache_hit, i_cache_miss, d_cache_hit, d_cache_miss;
+    wire [D_W-1:0] i_cache_rdata, d_cache_rdata;
+
+    wire i_cache_line_wr = (state == S_COMMIT && !filling_dcache);
+    wire d_cache_line_wr = (state == S_COMMIT && filling_dcache);
+    wire d_cache_word_wr = (state == S_WRITE && wb_ack_i && d_is_cacheable); 
+
+    l1_cache #(.ADDR_W(20), .WORD_W(16), .LINE_W(128), .IDX_W(2)) icache (
+        .clk(clk), .flush(rst), .req(!q_full && (i_tlb_hit || !tlb_en_i || fetch_from_itcm) && state == S_IDLE && i_is_cacheable),
+        .addr(i_p_addr), .line_wr_en(i_cache_line_wr), .wdata_line(line_buf), .word_wr_en(1'b0), .wdata_word(16'h0),
+        .rdata_word(i_cache_rdata), .hit(i_cache_hit), .miss(i_cache_miss)
+    );
+
+    l1_cache #(.ADDR_W(20), .WORD_W(16), .LINE_W(128), .IDX_W(2)) dcache (
+        .clk(clk), .flush(rst), .req(eu_d_req && (d_tlb_hit || !tlb_en_i) && state == S_IDLE && d_is_cacheable),
+        .addr(d_p_addr), .line_wr_en(d_cache_line_wr), .wdata_line(line_buf), .word_wr_en(d_cache_word_wr), .wdata_word(eu_d_wdata),
+        .rdata_word(d_cache_rdata), .hit(d_cache_hit), .miss(d_cache_miss)
+    );
+
+    assign eu_d_rdata = d_is_cacheable ? d_cache_rdata : wb_dat_i;
+    wire [D_W-1:0] i_data = i_is_cacheable ? i_cache_rdata : wb_dat_i;
+
+    always @(*) begin
+        eu_d_rdy = 1'b0;
+        if (eu_d_req) begin
+            if (eu_d_we) eu_d_rdy = (state == S_WRITE && wb_ack_i);
+            else eu_d_rdy = d_is_cacheable ? (d_cache_hit && state == S_IDLE) : (state == S_UNCACHEABLE_RD && wb_ack_i);
+        end
+    end
+
+    wire itcm_fetch_ready = fetch_from_itcm && !q_full;
+    wire mem_fetch_ready  = fetch_from_mem && (i_is_cacheable ? (i_cache_hit && !q_full && state == S_IDLE) : (state == S_UNCACHEABLE_FETCH && wb_ack_i && !q_full));
+    wire i_fetch_ready = itcm_fetch_ready || mem_fetch_ready;
+    wire [7:0] byte_to_push = fetch_from_itcm ? itcm_byte : (ip[0] ? i_data[15:8] : i_data[7:0]);
+
+    prefetch_queue #(.DEPTH(6), .DATA_W(8)) p_queue (
+        .clk(clk), .rst(rst | branch_en), .push(i_fetch_ready), .din(byte_to_push),
+        .full(q_full), .pop(q_pop), .dout(q_dout), .empty(q_empty)
+    );
+
+    always @(posedge clk) begin
+        if (rst) ip <= 16'h0000;              
+        else if (branch_en) ip <= branch_addr; 
+        else if (i_fetch_ready) ip <= ip + 1'b1; 
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= S_IDLE; wb_cyc_o <= 0; wb_stb_o <= 0; wb_we_o <= 0; wb_adr_o <= 0; wb_dat_o <= 0;    
+        end else begin
+            case (state)
+                S_IDLE: begin
+                    if (eu_d_req && (d_tlb_hit || !tlb_en_i) && eu_d_we) begin
+                        wb_cyc_o <= 1; wb_stb_o <= 1; wb_we_o <= 1;
+                        wb_adr_o <= {d_p_addr[19:16], 1'b0, d_p_addr[15:1]}; wb_dat_o <= eu_d_wdata;
+                        if (d_is_cacheable && d_cache_miss) begin
+                            filling_dcache <= 1;
+                            case (d_p_addr[3:1])
+                                3'b000: line_buf <= {112'h0, eu_d_wdata}; 3'b001: line_buf <= {96'h0, eu_d_wdata, 16'h0};
+                                3'b010: line_buf <= {80'h0, eu_d_wdata, 32'h0}; 3'b011: line_buf <= {64'h0, eu_d_wdata, 48'h0};
+                                3'b100: line_buf <= {48'h0, eu_d_wdata, 64'h0}; 3'b101: line_buf <= {32'h0, eu_d_wdata, 80'h0};
+                                3'b110: line_buf <= {16'h0, eu_d_wdata, 96'h0}; 3'b111: line_buf <= {eu_d_wdata, 112'h0};
+                            endcase
+                        end else filling_dcache <= 0;
+                        state <= S_WRITE;
+                    end
+                    else if (eu_d_req && (d_tlb_hit || !tlb_en_i) && !eu_d_we) begin
+                        if (d_is_cacheable) begin
+                            if (d_cache_miss) begin
+                                wb_cyc_o <= 1; wb_stb_o <= 1; wb_we_o <= 0;
+                                base_addr <= {d_p_addr[19:4], 4'b0000}; 
+                                wb_adr_o  <= {d_p_addr[19:16], 1'b0, d_p_addr[15:4], 3'b000}; 
+                                filling_dcache <= 1; beat_cnt <= 0; state <= S_BURST;
+                            end
+                        end else begin
+                            wb_cyc_o <= 1; wb_stb_o <= 1; wb_we_o <= 0;
+                            wb_adr_o <= {d_p_addr[19:16], 1'b0, d_p_addr[15:1]}; 
+                            state <= S_UNCACHEABLE_RD;
+                        end
+                    end
+                    else if (!q_full && (i_tlb_hit || !tlb_en_i) && fetch_from_mem) begin
+                        if (i_is_cacheable) begin
+                            if (i_cache_miss) begin
+                                wb_cyc_o <= 1; wb_stb_o <= 1; wb_we_o <= 0;
+                                base_addr <= {i_p_addr[19:4], 4'b0000}; 
+                                wb_adr_o  <= {i_p_addr[19:16], 1'b0, i_p_addr[15:4], 3'b000}; 
+                                filling_dcache <= 0; beat_cnt <= 0; state <= S_BURST;
+                            end
+                        end else begin
+                            wb_cyc_o <= 1; wb_stb_o <= 1; wb_we_o <= 0;
+                            wb_adr_o <= {i_p_addr[19:16], 1'b0, i_p_addr[15:1]}; 
+                            state <= S_UNCACHEABLE_FETCH;
+                        end
+                    end
+                end
+                S_BURST: begin
+                    if (wb_ack_i) begin
+                        case (beat_cnt)
+                            3'b000: line_buf[15:0]    <= wb_dat_i;  3'b001: line_buf[31:16]   <= wb_dat_i;
+                            3'b010: line_buf[47:32]   <= wb_dat_i;  3'b011: line_buf[63:48]   <= wb_dat_i;
+                            3'b100: line_buf[79:64]   <= wb_dat_i;  3'b101: line_buf[95:80]   <= wb_dat_i;
+                            3'b110: line_buf[111:96]  <= wb_dat_i;  3'b111: line_buf[127:112] <= wb_dat_i;
+                        endcase
+                        if (beat_cnt == 3'b111) begin wb_cyc_o <= 0; wb_stb_o <= 0; state <= S_COMMIT; end 
+                        else begin beat_cnt <= beat_cnt + 1; wb_adr_o <= {base_addr[19:16], 1'b0, base_addr[15:4], 3'b000} + {17'h0, beat_cnt} + 20'h1; end
+                    end
+                end
+                S_COMMIT: state <= S_IDLE; 
+                S_WRITE: begin if (wb_ack_i) begin wb_cyc_o <= 0; wb_stb_o <= 0; wb_we_o <= 0; if (filling_dcache) state <= S_COMMIT; else state <= S_IDLE; end end
+                S_UNCACHEABLE_RD, S_UNCACHEABLE_FETCH: begin if (wb_ack_i) begin wb_cyc_o <= 0; wb_stb_o <= 0; state <= S_IDLE; end end
+            endcase
+        end
+    end
+endmodule
+
+
+// ============================================================================
+// MODULE 3: L1 Cache
+// ============================================================================
+module l1_cache #(parameter ADDR_W = 20, parameter WORD_W = 16, parameter LINE_W = 128, parameter IDX_W = 2)(
+    input  wire              clk, flush, req,
+    input  wire [ADDR_W-1:0] addr,
+    input  wire              line_wr_en, input  wire [LINE_W-1:0] wdata_line,
+    input  wire              word_wr_en, input  wire [WORD_W-1:0] wdata_word,
+    output reg  [WORD_W-1:0] rdata_word, output reg hit, miss
+);
+    localparam DEPTH = 1 << IDX_W; 
+    localparam TAG_W = ADDR_W - (IDX_W + 4); 
+    wire [2:0]       word_off = addr[3:1];          
+    wire [IDX_W-1:0] idx      = addr[IDX_W+3 : 4];  
+    wire [TAG_W-1:0] tag      = addr[ADDR_W-1 : IDX_W+4]; 
+
+    reg [TAG_W-1:0]  tag_ram  [0:DEPTH-1];
+    reg [LINE_W-1:0] data_ram [0:DEPTH-1];
+    reg              valid    [0:DEPTH-1];
+    integer i;
+
+    always @(posedge clk) begin
+        if (flush) begin
+            for (i = 0; i < DEPTH; i = i + 1) valid[i] <= 1'b0;
+        end else begin
+            if (line_wr_en) begin
+                valid[idx]    <= 1'b1; tag_ram[idx]  <= tag; data_ram[idx] <= wdata_line;
+            end
+            else if (word_wr_en && valid[idx] && (tag_ram[idx] == tag)) begin
+                case (word_off)
+                    3'b000: data_ram[idx][15:0]    <= wdata_word;
+                    3'b001: data_ram[idx][31:16]   <= wdata_word;
+                    3'b010: data_ram[idx][47:32]   <= wdata_word;
+                    3'b011: data_ram[idx][63:48]   <= wdata_word;
+                    3'b100: data_ram[idx][79:64]   <= wdata_word;
+                    3'b101: data_ram[idx][95:80]   <= wdata_word;
+                    3'b110: data_ram[idx][111:96]  <= wdata_word;
+                    3'b111: data_ram[idx][127:112] <= wdata_word;
+                endcase
+            end
+        end
+    end
+
+    wire [LINE_W-1:0] selected_line = data_ram[idx];
+    always @(*) begin
+        hit = 1'b0; miss = 1'b0; rdata_word = {WORD_W{1'b0}}; 
+        if (req) begin
+            if (valid[idx] && (tag_ram[idx] == tag)) begin
+                hit = 1'b1; 
+                case (word_off)
+                    3'b000: rdata_word = selected_line[15:0];
+                    3'b001: rdata_word = selected_line[31:16];
+                    3'b010: rdata_word = selected_line[47:32];
+                    3'b011: rdata_word = selected_line[63:48];
+                    3'b100: rdata_word = selected_line[79:64];
+                    3'b101: rdata_word = selected_line[95:80];
+                    3'b110: rdata_word = selected_line[111:96];
+                    3'b111: rdata_word = selected_line[127:112];
+                endcase
+            end else miss = 1'b1;
+        end
+    end
+endmodule
+
+// ============================================================================
+// NEW MODULE C: Wishbone Asynchronous CDC Bridge
+// ============================================================================
+module wishbone_cdc_bridge #(parameter ADDR_W = 20, parameter DATA_W = 16)(
+    input  wire              clk_a, rst_a,
+    input  wire [ADDR_W-1:0] s_adr_i, input wire [DATA_W-1:0] s_dat_i, output reg [DATA_W-1:0] s_dat_o,
+    input  wire              s_we_i, s_stb_i, s_cyc_i, output reg s_ack_o,
+
+    input  wire              clk_b, rst_b,
+    output reg  [ADDR_W-1:0] m_adr_o, output reg [DATA_W-1:0] m_dat_o, input wire [DATA_W-1:0] m_dat_i,
+    output reg               m_we_o, m_stb_o, m_cyc_o, input wire m_ack_i
+);
+    wire cmd_full, cmd_empty, rsp_full, rsp_empty;
+    wire [ADDR_W+DATA_W:0] cmd_din = {s_we_i, s_adr_i, s_dat_i};
+    wire [ADDR_W+DATA_W:0] cmd_dout;
+    wire [DATA_W-1:0]      rsp_dout;
+    reg cmd_push, cmd_pop, rsp_push, rsp_pop;
+
+    async_fifo #(.DATA_W(ADDR_W+DATA_W+1), .ADDR_W(4)) cmd_fifo (
+        .wclk(clk_a), .wrst(rst_a), .winc(cmd_push), .wdata(cmd_din), .wfull(cmd_full),
+        .rclk(clk_b), .rrst(rst_b), .rinc(cmd_pop),  .rdata(cmd_dout), .rempty(cmd_empty)
+    );
+
+    async_fifo #(.DATA_W(DATA_W), .ADDR_W(4)) rsp_fifo (
+        .wclk(clk_b), .wrst(rst_b), .winc(rsp_push), .wdata(m_dat_i), .wfull(rsp_full),
+        .rclk(clk_a), .rrst(rst_a), .rinc(rsp_pop),  .rdata(rsp_dout), .rempty(rsp_empty)
+    );
+
+    reg state_a;
+    always @(posedge clk_a) begin
+        if (rst_a) begin state_a <= 0; s_ack_o <= 0; cmd_push <= 0; rsp_pop <= 0; s_dat_o <= 0; end 
+        else begin
+            s_ack_o <= 0; cmd_push <= 0; rsp_pop <= 0;
+            case (state_a)
+                0: if (s_cyc_i && s_stb_i && !s_ack_o && !cmd_full) begin cmd_push <= 1; state_a <= 1; end
+                1: if (!rsp_empty) begin rsp_pop <= 1; s_dat_o <= rsp_dout; s_ack_o <= 1; state_a <= 0; end
+            endcase
+        end
+    end
+
+    reg state_b;
+    always @(posedge clk_b) begin
+        if (rst_b) begin state_b <= 0; m_cyc_o <= 0; m_stb_o <= 0; m_we_o <= 0; cmd_pop <= 0; rsp_push <= 0; end 
+        else begin
+            cmd_pop <= 0; rsp_push <= 0;
+            case (state_b)
+                0: if (!cmd_empty && !rsp_full) begin
+                       cmd_pop <= 1; m_we_o <= cmd_dout[ADDR_W+DATA_W]; m_adr_o <= cmd_dout[ADDR_W+DATA_W-1 : DATA_W];
+                       m_dat_o <= cmd_dout[DATA_W-1 : 0]; m_cyc_o <= 1; m_stb_o <= 1; state_b <= 1;
+                   end
+                1: if (m_ack_i) begin m_cyc_o <= 0; m_stb_o <= 0; rsp_push <= 1; state_b <= 0; end
+            endcase
+        end
+    end
+endmodule
+
+// ============================================================================
+// MODULE 13: CUSTOM 8086 CORE WRAPPER
+// ============================================================================
+module custom_8086_core #(parameter V_ADDR = 16, parameter P_ADDR = 20, parameter DATA_W = 16)(
+    input  wire              clk_i, rst_i, tlb_wr_en,
+    input  wire [11:0]       tlb_wr_v_tag, input  wire [15:0] tlb_wr_p_tag,
+    output wire [P_ADDR-1:0] wb_adr_o, output wire [DATA_W-1:0] wb_dat_o, input  wire [DATA_W-1:0] wb_dat_i,
+    output wire              wb_we_o, output wire wb_stb_o, output wire wb_cyc_o, input  wire wb_ack_i,
+    input  wire              wb_err_i, output wire trig1_o, trig2_o, trig3_o, input  wire intr_i,
+    input  wire [2:0]        ip_done_i
+);
+    wire [V_ADDR-1:0] d_addr; wire [DATA_W-1:0] d_wdata, d_rdata; wire d_req, d_we, d_rdy;
+    wire q_empty, q_pop; wire [7:0] q_dout; wire cache_en, tlb_en;
+    wire branch_en; wire [15:0] branch_addr;
+
+    execution_unit #(.DATA_W(DATA_W), .ADDR_W(V_ADDR)) eu_inst (
+        .clk(clk_i), .rst(rst_i), .q_empty(q_empty), .q_dout(q_dout), .q_pop(q_pop),
+        .d_addr(d_addr), .d_wdata(d_wdata), .d_req(d_req), .d_we(d_we), .d_rdata(d_rdata), .d_rdy(d_rdy), .wb_err_i(wb_err_i),
+        .cache_en_o(cache_en), .tlb_en_o(tlb_en), 
+        .trig1_o(trig1_o), .trig2_o(trig2_o), .trig3_o(trig3_o), .intr_i(intr_i),
+        .ip_done_i(ip_done_i), .branch_en(branch_en), .branch_addr(branch_addr)
+    );
+
+    bus_interface_unit #(.V_ADDR(V_ADDR), .P_ADDR(P_ADDR), .D_W(DATA_W)) biu_inst (
+        .clk(clk_i), .rst(rst_i), .q_empty(q_empty), .q_dout(q_dout), .q_pop(q_pop),
+        .eu_d_addr(d_addr), .eu_d_wdata(d_wdata), .eu_d_req(d_req), .eu_d_we(d_we), .eu_d_rdata(d_rdata), .eu_d_rdy(d_rdy),
+        .cache_en_i(cache_en), .tlb_en_i(tlb_en), .tlb_wr_en(tlb_wr_en), .tlb_wr_v_tag(tlb_wr_v_tag), .tlb_wr_p_tag(tlb_wr_p_tag),
+        .wb_adr_o(wb_adr_o), .wb_dat_o(wb_dat_o), .wb_dat_i(wb_dat_i), .wb_we_o(wb_we_o), .wb_stb_o(wb_stb_o), .wb_cyc_o(wb_cyc_o), .wb_ack_i(wb_ack_i),
+        .branch_en(branch_en), .branch_addr(branch_addr)
+    );
+endmodule
+
+
+// ============================================================================
+// ============================================================================
+// MODULE 7: Execution Unit (EU) with 4-Phase Handshake Latches
+// ============================================================================
+module execution_unit #(parameter DATA_W = 16, parameter ADDR_W = 16)(
+    input  wire              clk, rst, wb_err_i, 
+    input  wire              q_empty, input  wire [7:0] q_dout, output reg q_pop,
+    output reg  [ADDR_W-1:0] d_addr, output reg [DATA_W-1:0] d_wdata,
+    output reg               d_req, output reg d_we,
+    input  wire [DATA_W-1:0] d_rdata, input  wire d_rdy,
+    output wire              cache_en_o, output wire tlb_en_o,
+    
+    output wire              trig1_o, trig2_o, trig3_o,
+    input  wire [2:0]        ip_done_i, 
+    input  wire              intr_i,
+    output reg               branch_en, output reg [15:0] branch_addr
+);
+    reg [15:0] ax, bx, cx, dx, si, di; reg [7:0] opcode, modrm, temp_lo, temp_hi;
+    reg IF_flag; reg [15:0] ip_save, eu_ip; 
+    reg [1:0] CR0; assign cache_en_o = CR0[0]; assign tlb_en_o = CR0[1];
+
+    // Zero Flag for Conditional Branching
+    reg ZF; 
+    reg [3:0] state, next_state;
+    reg  [DATA_W-1:0] alu_in_a, alu_in_b; reg [2:0] alu_cmd; wire [DATA_W-1:0] alu_out;
+
+    reg trig1_reg, trig2_reg, trig3_reg;
+    always @(posedge clk) begin
+        if (rst) begin
+            trig1_reg <= 1'b0; trig2_reg <= 1'b0; trig3_reg <= 1'b0;
+        end else begin
+            if (state == 4'd5) begin
+                if (opcode == 8'hE1) trig1_reg <= 1'b1;
+                if (opcode == 8'hE2) trig2_reg <= 1'b1;
+                if (opcode == 8'hE3) trig3_reg <= 1'b1;
+            end
+            if (ip_done_i[0]) trig1_reg <= 1'b0;
+            if (ip_done_i[1]) trig2_reg <= 1'b0;
+            if (ip_done_i[2]) trig3_reg <= 1'b0;
+        end
+    end
+    assign trig1_o = trig1_reg;
+    assign trig2_o = trig2_reg;
+    assign trig3_o = trig3_reg;
+
+    // ADDED: S_BRANCH_WAIT state (4'd9)
+    localparam S_FETCH_OP = 4'd0, S_DECODE = 4'd1, S_FETCH_MODRM = 4'd2;
+    localparam S_FETCH_LO = 4'd3, S_FETCH_HI = 4'd4, S_EXEC = 4'd5, S_MEM_WAIT = 4'd6;
+    localparam S_INT_HANDLE = 4'd7, S_HALT = 4'd8, S_BRANCH_WAIT = 4'd9;
+    
+    alu #(.DATA_W(DATA_W)) core_alu (.op_a(alu_in_a), .op_b(alu_in_b), .alu_ctrl(alu_cmd), .result(alu_out));
+
+    always @(*) begin
+        alu_in_a = ax; alu_in_b = bx; alu_cmd = 3'b100; 
+        if (opcode == 8'hB8 || opcode == 8'hB9 || opcode == 8'hBB || opcode == 8'hBE || opcode == 8'hBF) begin
+            alu_in_b = {temp_hi, temp_lo}; alu_cmd = 3'b100; 
+        end else if (opcode == 8'h01 && modrm == 8'hD8) begin alu_in_a = ax; alu_in_b = bx; alu_cmd = 3'b000; end
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= S_FETCH_OP; opcode <= 0; temp_lo <= 0; temp_hi <= 0;
+            eu_ip <= 0; ip_save <= 0; ax <= 0; bx <= 0; cx <= 0; CR0 <= 2'b00; IF_flag <= 0; branch_en <= 0; branch_addr <= 0;
+            ZF <= 0; // Initialize Zero Flag
+        end else if (wb_err_i) begin
+            state <= S_FETCH_OP; 
+        end else begin
+            state <= next_state; branch_en <= 0; 
+            if (q_pop) eu_ip <= eu_ip + 1;
+
+            if (state == S_FETCH_OP && !q_empty) opcode <= q_dout;
+            else if (state == S_FETCH_MODRM && !q_empty) modrm <= q_dout;
+            else if (state == S_FETCH_LO && !q_empty) temp_lo <= q_dout;
+            else if (state == S_FETCH_HI && !q_empty) temp_hi <= q_dout;
+            else if (state == S_EXEC) begin
+                if (opcode == 8'hB8) ax <= alu_out; 
+                if (opcode == 8'hBB) bx <= alu_out; 
+                if (opcode == 8'hB9) cx <= alu_out; 
+                if (opcode == 8'h01 && modrm == 8'hD8) ax <= alu_out; 
+                if (opcode == 8'h0F) CR0 <= ax[1:0]; 
+                
+                if (opcode == 8'hFB) IF_flag <= 1'b1; 
+                if (opcode == 8'hFA) IF_flag <= 1'b0; 
+                
+                // Branching Logic
+                if (opcode == 8'h3D) ZF <= (ax == {temp_hi, temp_lo}); // CMP logic
+                
+                if (opcode == 8'hCF) begin 
+                    branch_en <= 1'b1; branch_addr <= ip_save; eu_ip <= ip_save; IF_flag <= 1'b1; 
+                end
+                
+                // JMP (E9) or JE (74) if ZF is 1
+                if (opcode == 8'hE9 || (opcode == 8'h74 && ZF)) begin 
+                    branch_en <= 1'b1; 
+                    branch_addr <= {temp_hi, temp_lo}; 
+                    eu_ip <= {temp_hi, temp_lo}; 
+                end
+            end
+            else if (state == S_MEM_WAIT && d_rdy) begin
+                if (opcode == 8'hA1) ax <= d_rdata; 
+            end
+            else if (state == S_INT_HANDLE) begin
+                ip_save <= eu_ip; 
+                branch_en <= 1'b1; 
+                branch_addr <= 16'h0400; eu_ip <= 16'h0400; 
+                IF_flag <= 1'b0;       
+            end
+        end
+    end
+
+    always @(*) begin
+        next_state = state; q_pop = 1'b0; d_req = 1'b0; d_we = 1'b0; d_addr = 0; d_wdata = 0;
+        case (state)
+            S_FETCH_OP: if (!q_empty) begin q_pop = 1'b1; next_state = S_DECODE; end
+            S_DECODE: begin
+                if (intr_i && IF_flag) next_state = S_INT_HANDLE;
+                else if (opcode == 8'hB8 || opcode == 8'hBB || opcode == 8'hB9 || opcode == 8'hBE || opcode == 8'hBF || opcode == 8'hA3 || opcode == 8'hA1 || opcode == 8'h3D || opcode == 8'h74 || opcode == 8'hE9) next_state = S_FETCH_LO;                
+                else if (opcode == 8'h01) next_state = S_FETCH_MODRM;
+                else if (opcode == 8'hE1 || opcode == 8'hE2 || opcode == 8'hE3 || opcode == 8'h0F || opcode == 8'hFB || opcode == 8'hFA || opcode == 8'hCF) next_state = S_EXEC; 
+                else if (opcode == 8'hF4) next_state = S_HALT;
+                else next_state = S_FETCH_OP; 
+            end
+            S_FETCH_MODRM: if (!q_empty) begin q_pop = 1'b1; next_state = S_EXEC; end
+            S_FETCH_LO:    if (!q_empty) begin q_pop = 1'b1; next_state = S_FETCH_HI; end
+            S_FETCH_HI:    if (!q_empty) begin q_pop = 1'b1; next_state = S_EXEC; end
+            S_EXEC: begin
+                if (opcode == 8'hA3) begin d_req = 1'b1; d_we = 1'b1; d_addr = {temp_hi, temp_lo}; d_wdata = ax; next_state = S_MEM_WAIT; end 
+                else if (opcode == 8'hA1) begin d_req = 1'b1; d_we = 1'b0; d_addr = {temp_hi, temp_lo}; next_state = S_MEM_WAIT; end 
+                
+                // ADDED: Go to S_BRANCH_WAIT if a jump is actively taken
+                else if (opcode == 8'hCF || opcode == 8'hE9 || (opcode == 8'h74 && ZF)) next_state = S_BRANCH_WAIT; 
+                
+                else next_state = S_FETCH_OP;
+            end
+            S_MEM_WAIT: begin
+                if (opcode == 8'hA3) begin d_req = 1'b1; d_we = 1'b1; d_addr = {temp_hi, temp_lo}; d_wdata = ax; end
+                else if (opcode == 8'hA1) begin d_req = 1'b1; d_we = 1'b0; d_addr = {temp_hi, temp_lo}; end
+                if (d_rdy) next_state = S_FETCH_OP;
+            end
+            
+            // ADDED: Force a wait state after an interrupt triggers
+            S_INT_HANDLE: next_state = S_BRANCH_WAIT; 
+            
+            // ADDED: Stall for 1 cycle to let the Fetch FIFO clear out old garbage
+            S_BRANCH_WAIT: next_state = S_FETCH_OP;
+            
+            S_HALT: begin 
+                if (intr_i && IF_flag) next_state = S_INT_HANDLE; 
+                else next_state = S_HALT; 
+            end
+            default: next_state = S_FETCH_OP;
+        endcase
+    end
+endmodule
+
+// ============================================================================
+// MODULE: Integrated Clock Gating (ICG) Cell
+// ============================================================================
+module icg_cell (
+    input  wire clk_i,
+    input  wire en_i,
+    output wire clk_o
+);
+    reg latched_en;
+    
+    // Negative-level sensitive latch guarantees glitch-free clock gating
+    always @(clk_i or en_i) begin
+        if (!clk_i) latched_en <= en_i;
+    end
+    
+    assign clk_o = clk_i & latched_en;
+endmodule
+
+
+// ============================================================================
+// MODULE 11: WISHBONE INTERCONNECT (4x6 MATRIX)
+// ============================================================================
+module wishbone_interconnect #(parameter ADDR_W = 20, parameter DATA_W = 16)(
+    input  wire [ADDR_W-1:0] m0_adr_i, input  wire [DATA_W-1:0] m0_dat_i, output reg [DATA_W-1:0] m0_dat_o, input wire m0_we_i, m0_stb_i, m0_cyc_i, output reg m0_ack_o, m0_err_o,
+    input  wire [ADDR_W-1:0] m1_adr_i, input  wire [DATA_W-1:0] m1_dat_i, output reg [DATA_W-1:0] m1_dat_o, input wire m1_we_i, m1_stb_i, m1_cyc_i, output reg m1_ack_o,
+    input  wire [ADDR_W-1:0] m2_adr_i, input  wire [DATA_W-1:0] m2_dat_i, output reg [DATA_W-1:0] m2_dat_o, input wire m2_we_i, m2_stb_i, m2_cyc_i, output reg m2_ack_o,
+    input  wire [ADDR_W-1:0] m3_adr_i, input  wire [DATA_W-1:0] m3_dat_i, output reg [DATA_W-1:0] m3_dat_o, input wire m3_we_i, m3_stb_i, m3_cyc_i, output reg m3_ack_o,
+    
+    output reg  [ADDR_W-1:0] s0_adr_o, output reg  [DATA_W-1:0] s0_dat_o, input  wire [DATA_W-1:0] s0_dat_i, output reg s0_we_o, s0_stb_o, s0_cyc_o, input wire s0_ack_i,
+    output reg  [ADDR_W-1:0] s1_adr_o, output reg  [DATA_W-1:0] s1_dat_o, input  wire [DATA_W-1:0] s1_dat_i, output reg s1_we_o, s1_stb_o, s1_cyc_o, input wire s1_ack_i,
+    output reg  [ADDR_W-1:0] s2_adr_o, output reg  [DATA_W-1:0] s2_dat_o, input  wire [DATA_W-1:0] s2_dat_i, output reg s2_we_o, s2_stb_o, s2_cyc_o, input wire s2_ack_i,
+    output reg  [ADDR_W-1:0] s3_adr_o, output reg  [DATA_W-1:0] s3_dat_o, input  wire [DATA_W-1:0] s3_dat_i, output reg s3_we_o, s3_stb_o, s3_cyc_o, input wire s3_ack_i,
+    output reg  [ADDR_W-1:0] s4_adr_o, output reg  [DATA_W-1:0] s4_dat_o, input  wire [DATA_W-1:0] s4_dat_i, output reg s4_we_o, s4_stb_o, s4_cyc_o, input wire s4_ack_i,
+    output reg  [ADDR_W-1:0] s5_adr_o, output reg  [DATA_W-1:0] s5_dat_o, input  wire [DATA_W-1:0] s5_dat_i, output reg s5_we_o, s5_stb_o, s5_cyc_o, input wire s5_ack_i
+);
+    wire [3:0] target_id = m0_adr_i[19:16];
+
+    wire m1_req_s0 = m1_cyc_i & m1_stb_i; wire m2_req_s0 = m2_cyc_i & m2_stb_i; wire m3_req_s0 = m3_cyc_i & m3_stb_i; wire m0_req_s0 = m0_cyc_i & m0_stb_i & (target_id == 4'h0);
+    wire m1_gnt = m1_req_s0; wire m2_gnt = m2_req_s0 & !m1_gnt; wire m3_gnt = m3_req_s0 & !m1_gnt & !m2_gnt; wire m0_gnt_s0 = m0_req_s0 & !m1_gnt & !m2_gnt & !m3_gnt;
+
+    always @(*) begin
+        s0_cyc_o = m1_gnt | m2_gnt | m3_gnt | m0_gnt_s0; s0_stb_o = m1_gnt | m2_gnt | m3_gnt | m0_gnt_s0;
+        s0_we_o  = m1_gnt ? m1_we_i  : m2_gnt ? m2_we_i  : m3_gnt ? m3_we_i  : m0_we_i;
+        s0_adr_o = m1_gnt ? m1_adr_i : m2_gnt ? m2_adr_i : m3_gnt ? m3_adr_i : m0_adr_i;
+        s0_dat_o = m1_gnt ? m1_dat_i : m2_gnt ? m2_dat_i : m3_gnt ? m3_dat_i : m0_dat_i;
+        
+        m1_ack_o = 1'b0; m2_ack_o = 1'b0; m3_ack_o = 1'b0;
+        if (m1_gnt) m1_ack_o = s0_ack_i; if (m2_gnt) m2_ack_o = s0_ack_i; if (m3_gnt) m3_ack_o = s0_ack_i;
+        m1_dat_o = s0_dat_i; m2_dat_o = s0_dat_i; m3_dat_o = s0_dat_i;
+    end
+
+    always @(*) begin
+        s1_cyc_o = m0_cyc_i & (target_id == 4'h7); s1_stb_o = m0_stb_i & (target_id == 4'h7); s1_we_o = m0_we_i; s1_adr_o = m0_adr_i; s1_dat_o = m0_dat_i;
+        s2_cyc_o = m0_cyc_i & (target_id == 4'h1); s2_stb_o = m0_stb_i & (target_id == 4'h1); s2_we_o = m0_we_i; s2_adr_o = m0_adr_i; s2_dat_o = m0_dat_i;
+        s3_cyc_o = m0_cyc_i & (target_id == 4'h2); s3_stb_o = m0_stb_i & (target_id == 4'h2); s3_we_o = m0_we_i; s3_adr_o = m0_adr_i; s3_dat_o = m0_dat_i;
+        s4_cyc_o = m0_cyc_i & (target_id == 4'h3); s4_stb_o = m0_stb_i & (target_id == 4'h3); s4_we_o = m0_we_i; s4_adr_o = m0_adr_i; s4_dat_o = m0_dat_i;
+        s5_cyc_o = m0_cyc_i & (target_id == 4'h5); s5_stb_o = m0_stb_i & (target_id == 4'h5); s5_we_o = m0_we_i; s5_adr_o = m0_adr_i; s5_dat_o = m0_dat_i;
+    end
+
+    always @(*) begin
+        m0_err_o = 1'b0; m0_dat_o = 16'h0; m0_ack_o = 1'b0;
+        if (m0_cyc_i && m0_we_i && ((m0_adr_i >= 20'h400 && m0_adr_i <= 20'h47F) || (m0_adr_i >= 20'h500 && m0_adr_i <= 20'h57F) || (m0_adr_i >= 20'h600 && m0_adr_i <= 20'h67F))) begin
+            m0_err_o = 1'b1; m0_ack_o = 1'b1; 
+        end else if (m0_cyc_i && m0_stb_i) begin
+            case (target_id)
+                4'h0: begin m0_dat_o = s0_dat_i; m0_ack_o = m0_gnt_s0 ? s0_ack_i : 1'b0; end 
+                4'h1: begin m0_dat_o = s2_dat_i; m0_ack_o = s2_ack_i; end 
+                4'h2: begin m0_dat_o = s3_dat_i; m0_ack_o = s3_ack_i; end 
+                4'h3: begin m0_dat_o = s4_dat_i; m0_ack_o = s4_ack_i; end 
+                4'h5: begin m0_dat_o = s5_dat_i; m0_ack_o = s5_ack_i; end 
+                4'h7: begin m0_dat_o = s1_dat_i; m0_ack_o = s1_ack_i; end 
+                default: begin m0_err_o = 1'b1; m0_ack_o = 1'b1; end 
+            endcase
+        end
+    end
+endmodule
+
+
+// ============================================================================
+// MODULE 8: DUAL-PORT IP CONTROLLER (With Auto-Clock Gating)
+// ============================================================================
+module ip_controller #(parameter BASE_ADDR = 20'h00200, parameter MAX_WORDS = 16'd64)(
+    input  wire clk, rst, cpu_trigger_i, sys_clk_en_i, output wire cpu_done_o, 
+    output reg m_cyc_o, output reg m_stb_o, output reg m_we_o, output reg [19:0] m_adr_o, output reg [15:0] m_dat_o, input wire m_ack_i,
+    input  wire        s_cyc_i, s_stb_i, s_we_i, input  wire [19:0] s_adr_i, input  wire [15:0] s_dat_i, output reg  [15:0] s_dat_o, output reg s_ack_o
+);
+    reg [1:0] state; 
+    
+    // --- SMART CLOCK GATING LOGIC ---
+    wire gated_clk;
+    
+    // Wake up if: SYSCON allows it AND (Resetting OR CPU Triggering OR Slave Access OR Currently Busy)
+    wire auto_wake_en = sys_clk_en_i & (rst | cpu_trigger_i | s_cyc_i | (state != 2'b00));
+    
+    icg_cell cg_inst (
+        .clk_i(clk),
+        .en_i(auto_wake_en),
+        .clk_o(gated_clk)
+    );
+    // --------------------------------
+
+    reg [15:0] local_ram [0:63]; 
+    reg [3:0] status_reg; // [3]=Reset, [2]=Timeout, [1]=Full, [0]=Success
+    assign cpu_done_o = |status_reg; 
+    
+    wire [6:0] s_offset = s_adr_i[6:0]; 
+    
+    // Notice: Powered by gated_clk!
+    always @(posedge gated_clk) begin
+        s_ack_o <= 1'b0;
+        if (s_cyc_i && s_stb_i && !s_ack_o) begin
+            if (s_we_i) begin
+                if (s_offset < 64) local_ram[s_offset[5:0]] <= s_dat_i;
+            end else begin
+                if (s_offset < 64) s_dat_o <= local_ram[s_offset[5:0]];
+                else if (s_offset == 7'h40) s_dat_o <= {12'h0, status_reg};
+                else s_dat_o <= 16'h0;
+            end
+            s_ack_o <= 1'b1;
+        end
+    end
+
+    reg [15:0] words_written; reg [19:0] target_addr; reg [7:0] timeout_cnt; 
+    wire is_full = (words_written >= MAX_WORDS);
+
+    // Notice: Powered by gated_clk!
+    always @(posedge gated_clk) begin
+        if (rst) begin
+            state <= 2'b00; m_cyc_o <= 1'b0; m_stb_o <= 1'b0; m_we_o <= 1'b0;
+            words_written <= 0; target_addr <= BASE_ADDR; timeout_cnt <= 0; 
+            status_reg <= 4'b1000; 
+        end else begin
+            if (s_cyc_i && s_stb_i && s_we_i && (s_offset == 7'h40) && !s_ack_o) begin
+                status_reg <= status_reg & ~s_dat_i[3:0]; // W1C
+            end
+            case (state)
+                2'b00: begin
+                    m_cyc_o <= 1'b0; m_stb_o <= 1'b0;
+                    if (cpu_trigger_i && (status_reg == 4'b0000)) begin
+                        if (is_full) begin status_reg[1] <= 1'b1; state <= 2'b10; end 
+                        else begin timeout_cnt <= 0; state <= 2'b01; end
+                    end
+                end
+                2'b01: begin
+                    m_cyc_o <= 1'b1; m_stb_o <= 1'b1; m_we_o <= 1'b1; m_adr_o <= target_addr; m_dat_o <= local_ram[words_written[5:0]];
+                    if (m_ack_i) begin
+                        m_stb_o <= 1'b0; words_written <= words_written + 1'b1; target_addr <= target_addr + 1'b1; timeout_cnt <= 0; 
+                        if ((words_written + 1'b1) >= MAX_WORDS) begin m_cyc_o <= 1'b0; status_reg[0] <= 1'b1; state <= 2'b10; end
+                    end else begin
+                        timeout_cnt <= timeout_cnt + 1'b1;
+                        if (timeout_cnt >= 8'd250) begin m_cyc_o <= 1'b0; m_stb_o <= 1'b0; status_reg[2] <= 1'b1; state <= 2'b10; end
+                    end
+                end
+                2'b10: begin if (!cpu_trigger_i) state <= 2'b00; end
+            endcase
+        end
+    end
+endmodule
+
+// ============================================================================
+// MODULE 5: ITCM (Internal Instruction Memory)
+// ============================================================================
+module itcm (input wire [15:0] ip_addr, output wire [15:0] instruction);
+    reg [15:0] rom_array [0:1024]; 
+    assign instruction = rom_array[ip_addr >> 1];
+endmodule
+
+
+// ============================================================================
+// MODULE 12: ASYNCHRONOUS DUAL-PORT MAIN MEMORY (150MHz Write / 100MHz Read)
+// ============================================================================
+module dual_clock_main_memory #(parameter ADDR_W = 20, parameter DATA_W = 16, parameter MEM_SIZE = 4096)(
+    input  wire rst_i,
+    input  wire              clk_w_150,
+    input  wire [ADDR_W-1:0] wb_wr_adr_i, input wire [DATA_W-1:0] wb_wr_dat_i, 
+    input  wire              wb_wr_we_i, wb_wr_stb_i, wb_wr_cyc_i, output reg wb_wr_ack_o,
+
+    input  wire              clk_r_100,
+    input  wire [ADDR_W-1:0] wb_rd_adr_i, output reg [DATA_W-1:0] wb_rd_dat_o,
+    input  wire              wb_rd_stb_i, wb_rd_cyc_i, output reg wb_rd_ack_o
+);
+    reg [DATA_W-1:0] ram [0:MEM_SIZE-1];
+    wire [$clog2(MEM_SIZE)-1:0] wr_idx = wb_wr_adr_i[$clog2(MEM_SIZE)-1:0];
+    wire [$clog2(MEM_SIZE)-1:0] rd_idx = wb_rd_adr_i[$clog2(MEM_SIZE)-1:0];
+
+    always @(posedge clk_w_150) begin
+        if (rst_i) wb_wr_ack_o <= 1'b0;
+        else begin
+            wb_wr_ack_o <= 1'b0; 
+            if (wb_wr_cyc_i && wb_wr_stb_i && wb_wr_we_i && !wb_wr_ack_o) begin
+                ram[wr_idx] <= wb_wr_dat_i; wb_wr_ack_o <= 1'b1; 
+            end
+        end
+    end
+
+    always @(posedge clk_r_100) begin
+        if (rst_i) begin wb_rd_ack_o <= 1'b0; wb_rd_dat_o <= 0; end 
+        else begin
+            wb_rd_ack_o <= 1'b0; 
+            // FIXED: Removed the undeclared !wb_rd_we_i check
+            if (wb_rd_cyc_i && wb_rd_stb_i && !wb_rd_ack_o) begin
+                wb_rd_dat_o <= ram[rd_idx]; wb_rd_ack_o <= 1'b1; 
+            end
+        end
+    end
+endmodule
+
+
+// ============================================================================
+// MODULE 9: Programmable Interrupt Controller (PIC) 
+// ============================================================================
+module programmable_interrupt_controller #(parameter DATA_W = 16)(
+    input  wire clk, rst, input  wire [2:0] ip_irq_i, output wire cpu_intr_o,
+    input  wire [15:0] wb_adr_i, input  wire [DATA_W-1:0] wb_dat_i, output reg  [DATA_W-1:0] wb_dat_o,
+    input  wire wb_we_i, input  wire wb_stb_i, input  wire wb_cyc_i, output reg wb_ack_o
+);
+    reg [2:0] irq_pending; reg [2:0] irq_mask; reg global_en; reg [2:0] ip_irq_sync;
+    assign cpu_intr_o = global_en ? |(irq_pending & irq_mask) : 1'b0;
+    
+    always @(posedge clk) begin
+        if (rst) begin ip_irq_sync <= 0; irq_pending <= 0; end 
+        else begin
+            ip_irq_sync <= ip_irq_i;
+            if (ip_irq_i[0] && !ip_irq_sync[0]) irq_pending[0] <= 1'b1;
+            if (ip_irq_i[1] && !ip_irq_sync[1]) irq_pending[1] <= 1'b1;
+            if (ip_irq_i[2] && !ip_irq_sync[2]) irq_pending[2] <= 1'b1;
+            if (wb_cyc_i && wb_stb_i && wb_we_i && (wb_adr_i[3:0] == 4'h2)) irq_pending <= irq_pending & ~wb_dat_i[2:0];
+        end
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin wb_ack_o <= 0; wb_dat_o <= 0; irq_mask <= 0; global_en <= 0; end 
+        else begin
+            wb_ack_o <= 0; 
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1; 
+                if (wb_we_i) begin
+                    if (wb_adr_i[3:0] == 4'h1) irq_mask  <= wb_dat_i[2:0];
+                    if (wb_adr_i[3:0] == 4'h3) global_en <= wb_dat_i[0];
+                end else begin
+                    case (wb_adr_i[3:0])
+                        4'h0: wb_dat_o <= {13'h0, (irq_pending & irq_mask)};
+                        4'h1: wb_dat_o <= {13'h0, irq_mask};                 
+                        4'h3: wb_dat_o <= {15'h0, global_en};                
+                        default: wb_dat_o <= 0;
+                    endcase
+                end
+            end
+        end
+    end
+endmodule
+
+// ============================================================================
+// MODULE 4: Prefetch Queue
+// ============================================================================
+module prefetch_queue #(parameter DEPTH = 6, parameter DATA_W = 8)(
+    input  wire              clk, rst, push,
+    input  wire [DATA_W-1:0] din, output wire full,
+    input  wire              pop, output reg [DATA_W-1:0] dout, output wire empty
+);
+    reg [DATA_W-1:0] q_mem [0:DEPTH-1]; reg [2:0] head, tail; reg [3:0] count; 
+    always @(posedge clk) begin
+        if (rst) begin head <= 0; tail <= 0; count <= 0; end 
+        else begin
+            if (push && !full) begin q_mem[tail] <= din; tail <= (tail == DEPTH-1) ? 0 : tail + 1; end
+            if (pop && !empty) begin head <= (head == DEPTH-1) ? 0 : head + 1; end
+            if (push && !full && pop && !empty) count <= count; 
+            else if (push && !full) count <= count + 1;
+            else if (pop && !empty) count <= count - 1;
+        end
+    end
+    assign full = (count == DEPTH); assign empty = (count == 0);
+    always @(*) dout = q_mem[head];
+endmodule
+
+
+// ============================================================================
+// MODULE 14: SOC TOP (With CDC Bridges)
+// ============================================================================
+module soc_top #(parameter V_ADDR = 16, parameter P_ADDR = 20, parameter DATA_W = 16, parameter MAIN_MEM_BYTES = 4096)(
+    input  wire clk_cpu_200, clk_dma_150, clk_mem_100, rst_i, 
+    input  wire tlb_wr_en, input wire [11:0] tlb_wr_v_tag, input wire [15:0] tlb_wr_p_tag
+);
+    wire [P_ADDR-1:0] m0_adr, m1_adr, m2_adr, m3_adr; 
+    wire [DATA_W-1:0] m0_dat_c2m, m0_dat_m2c, m1_dat_c2m, m1_dat_m2c, m2_dat_c2m, m2_dat_m2c, m3_dat_c2m, m3_dat_m2c;
+    wire m0_we, m0_stb, m0_cyc, m0_ack, m0_err, m1_we, m1_stb, m1_cyc, m1_ack, m2_we, m2_stb, m2_cyc, m2_ack, m3_we, m3_stb, m3_cyc, m3_ack;
+    
+    wire [P_ADDR-1:0] s0_adr, s1_adr, s2_adr, s3_adr, s4_adr, s5_adr; 
+    wire [DATA_W-1:0] s0_dat_o, s0_dat_i, s1_dat_o, s1_dat_i, s2_dat_o, s2_dat_i, s3_dat_o, s3_dat_i, s4_dat_o, s4_dat_i, s5_dat_o, s5_dat_i; 
+    wire s0_we, s0_stb, s0_cyc, s0_ack, s1_we, s1_stb, s1_cyc, s1_ack, s2_we, s2_stb, s2_cyc, s2_ack, s3_we, s3_stb, s3_cyc, s3_ack, s4_we, s4_stb, s4_cyc, s4_ack, s5_we, s5_stb, s5_cyc, s5_ack;
+    
+    wire t1, t2, t3; wire d1, d2, d3; wire intr_cpu;
+    wire soft_rst_ip1, soft_rst_ip2, soft_rst_ip3;
+    wire ce_ip1, ce_ip2, ce_ip3;
+    custom_8086_core #(.V_ADDR(V_ADDR), .P_ADDR(P_ADDR), .DATA_W(DATA_W)) cpu_core (
+        .clk_i(clk_cpu_200), .rst_i(rst_i), .tlb_wr_en(tlb_wr_en), .tlb_wr_v_tag(tlb_wr_v_tag), .tlb_wr_p_tag(tlb_wr_p_tag),
+        .wb_adr_o(m0_adr), .wb_dat_o(m0_dat_c2m), .wb_dat_i(m0_dat_m2c), .wb_we_o(m0_we), .wb_stb_o(m0_stb), .wb_cyc_o(m0_cyc), .wb_ack_i(m0_ack), .wb_err_i(m0_err),
+        .trig1_o(t1), .trig2_o(t2), .trig3_o(t3), .intr_i(intr_cpu), .ip_done_i({d3, d2, d1})
+    );
+
+    /*system_controller #(.DATA_W(DATA_W)) syscon_inst (
+        .clk(clk_cpu_200), .rst(rst_i),
+        .wb_adr_i(s5_adr[15:0]), .wb_dat_i(s5_dat_o), .wb_dat_o(s5_dat_i), .wb_we_i(s5_we), .wb_stb_i(s5_stb), .wb_cyc_i(s5_cyc), .wb_ack_o(s5_ack),
+        .ip1_rst_o(soft_rst_ip1), .ip2_rst_o(soft_rst_ip2), .ip3_rst_o(soft_rst_ip3)
+    );*/
+    system_controller #(.DATA_W(DATA_W)) syscon_inst (
+        .clk(clk_cpu_200), .rst(rst_i),
+        .wb_adr_i(s5_adr[15:0]), .wb_dat_i(s5_dat_o), .wb_dat_o(s5_dat_i), .wb_we_i(s5_we), .wb_stb_i(s5_stb), .wb_cyc_i(s5_cyc), .wb_ack_o(s5_ack),
+        .ip1_rst_o(soft_rst_ip1), .ip2_rst_o(soft_rst_ip2), .ip3_rst_o(soft_rst_ip3),
+        .ip1_ce_o(ce_ip1), .ip2_ce_o(ce_ip2), .ip3_ce_o(ce_ip3) // FIXED: Connected outputs
+    );
+    // Interconnect runs on the Combinational Logic path 
+    wishbone_interconnect #(.ADDR_W(P_ADDR), .DATA_W(DATA_W)) interconn (
+        .m0_adr_i(m0_adr), .m0_dat_i(m0_dat_c2m), .m0_dat_o(m0_dat_m2c), .m0_we_i(m0_we), .m0_stb_i(m0_stb), .m0_cyc_i(m0_cyc), .m0_ack_o(m0_ack), .m0_err_o(m0_err),
+        .m1_adr_i(m1_adr), .m1_dat_i(m1_dat_c2m), .m1_dat_o(m1_dat_m2c), .m1_we_i(m1_we), .m1_stb_i(m1_stb), .m1_cyc_i(m1_cyc), .m1_ack_o(m1_ack),
+        .m2_adr_i(m2_adr), .m2_dat_i(m2_dat_c2m), .m2_dat_o(m2_dat_m2c), .m2_we_i(m2_we), .m2_stb_i(m2_stb), .m2_cyc_i(m2_cyc), .m2_ack_o(m2_ack),
+        .m3_adr_i(m3_adr), .m3_dat_i(m3_dat_c2m), .m3_dat_o(m3_dat_m2c), .m3_we_i(m3_we), .m3_stb_i(m3_stb), .m3_cyc_i(m3_cyc), .m3_ack_o(m3_ack),
+        .s0_adr_o(s0_adr), .s0_dat_o(s0_dat_o), .s0_dat_i(s0_dat_i), .s0_we_o(s0_we), .s0_stb_o(s0_stb), .s0_cyc_o(s0_cyc), .s0_ack_i(s0_ack),
+        .s1_adr_o(s1_adr), .s1_dat_o(s1_dat_o), .s1_dat_i(s1_dat_i), .s1_we_o(s1_we), .s1_stb_o(s1_stb), .s1_cyc_o(s1_cyc), .s1_ack_i(s1_ack),
+        .s2_adr_o(s2_adr), .s2_dat_o(s2_dat_o), .s2_dat_i(s2_dat_i), .s2_we_o(s2_we), .s2_stb_o(s2_stb), .s2_cyc_o(s2_cyc), .s2_ack_i(s2_ack),
+        .s3_adr_o(s3_adr), .s3_dat_o(s3_dat_o), .s3_dat_i(s3_dat_i), .s3_we_o(s3_we), .s3_stb_o(s3_stb), .s3_cyc_o(s3_cyc), .s3_ack_i(s3_ack),
+        .s4_adr_o(s4_adr), .s4_dat_o(s4_dat_o), .s4_dat_i(s4_dat_i), .s4_we_o(s4_we), .s4_stb_o(s4_stb), .s4_cyc_o(s4_cyc), .s4_ack_i(s4_ack),
+        .s5_adr_o(s5_adr), .s5_dat_o(s5_dat_o), .s5_dat_i(s5_dat_i), .s5_we_o(s5_we), .s5_stb_o(s5_stb), .s5_cyc_o(s5_cyc), .s5_ack_i(s5_ack)
+    );
+
+    // Memory gets 150 MHz Write, 100 MHz Read
+    dual_clock_main_memory #(.ADDR_W(P_ADDR), .DATA_W(DATA_W), .MEM_SIZE(4096)) main_memory (
+        .rst_i(rst_i), 
+        .clk_w_150(clk_dma_150), .wb_wr_adr_i(s0_adr), .wb_wr_dat_i(s0_dat_o), .wb_wr_we_i(s0_we), .wb_wr_stb_i(s0_stb), .wb_wr_cyc_i(s0_cyc), .wb_wr_ack_o(s0_ack),
+        .clk_r_100(clk_mem_100), .wb_rd_adr_i(s0_adr), .wb_rd_dat_o(s0_dat_i), .wb_rd_stb_i(s0_stb), .wb_rd_cyc_i(s0_cyc)
+    );
+
+    // --- CDC BRIDGES AND IPs ---
+    wire [19:0] b1_adr, b2_adr, b3_adr;
+    wire [15:0] b1_d_m2s, b1_d_s2m, b2_d_m2s, b2_d_s2m, b3_d_m2s, b3_d_s2m;
+    wire b1_we, b1_stb, b1_cyc, b1_ack, b2_we, b2_stb, b2_cyc, b2_ack, b3_we, b3_stb, b3_cyc, b3_ack;
+        wishbone_cdc_bridge #(.ADDR_W(P_ADDR), .DATA_W(DATA_W)) ip1_bridge (
+        .clk_a(clk_cpu_200), .rst_a(rst_i), .s_adr_i(s2_adr), .s_dat_i(s2_dat_o), .s_dat_o(s2_dat_i), .s_we_i(s2_we), .s_stb_i(s2_stb), .s_cyc_i(s2_cyc), .s_ack_o(s2_ack),
+        .clk_b(clk_dma_150), .rst_b(rst_i), .m_adr_o(b1_adr), .m_dat_o(b1_d_m2s), .m_dat_i(b1_d_s2m), .m_we_o(b1_we), .m_stb_o(b1_stb), .m_cyc_o(b1_cyc), .m_ack_i(b1_ack)
+    );
+    ip_controller #(.BASE_ADDR(20'h00200), .MAX_WORDS(16'd64)) slave_ctrl_1 (
+        .clk(clk_dma_150), .rst(rst_i | soft_rst_ip1), .cpu_trigger_i(t1), .cpu_done_o(d1),.sys_clk_en_i(ce_ip1), 
+        .m_cyc_o(m1_cyc), .m_stb_o(m1_stb), .m_we_o(m1_we), .m_adr_o(m1_adr), .m_dat_o(m1_dat_c2m), .m_ack_i(m1_ack), 
+        .s_cyc_i(b1_cyc), .s_stb_i(b1_stb), .s_we_i(b1_we), .s_adr_i(b1_adr), .s_dat_i(b1_d_m2s), .s_dat_o(b1_d_s2m), .s_ack_o(b1_ack)
+    );
+
+    wishbone_cdc_bridge #(.ADDR_W(P_ADDR), .DATA_W(DATA_W)) ip2_bridge (
+        .clk_a(clk_cpu_200), .rst_a(rst_i), .s_adr_i(s3_adr), .s_dat_i(s3_dat_o), .s_dat_o(s3_dat_i), .s_we_i(s3_we), .s_stb_i(s3_stb), .s_cyc_i(s3_cyc), .s_ack_o(s3_ack),
+        .clk_b(clk_dma_150), .rst_b(rst_i), .m_adr_o(b2_adr), .m_dat_o(b2_d_m2s), .m_dat_i(b2_d_s2m), .m_we_o(b2_we), .m_stb_o(b2_stb), .m_cyc_o(b2_cyc), .m_ack_i(b2_ack)
+    );
+    ip_controller #(.BASE_ADDR(20'h00280), .MAX_WORDS(16'd64)) slave_ctrl_2 (
+        .clk(clk_dma_150), .rst(rst_i | soft_rst_ip2), .cpu_trigger_i(t2), .cpu_done_o(d2),.sys_clk_en_i(ce_ip2), 
+        .m_cyc_o(m2_cyc), .m_stb_o(m2_stb), .m_we_o(m2_we), .m_adr_o(m2_adr), .m_dat_o(m2_dat_c2m), .m_ack_i(m2_ack), 
+        .s_cyc_i(b2_cyc), .s_stb_i(b2_stb), .s_we_i(b2_we), .s_adr_i(b2_adr), .s_dat_i(b2_d_m2s), .s_dat_o(b2_d_s2m), .s_ack_o(b2_ack)
+    );
+
+    wishbone_cdc_bridge #(.ADDR_W(P_ADDR), .DATA_W(DATA_W)) ip3_bridge (
+        .clk_a(clk_cpu_200), .rst_a(rst_i), .s_adr_i(s4_adr), .s_dat_i(s4_dat_o), .s_dat_o(s4_dat_i), .s_we_i(s4_we), .s_stb_i(s4_stb), .s_cyc_i(s4_cyc), .s_ack_o(s4_ack),
+        .clk_b(clk_dma_150), .rst_b(rst_i), .m_adr_o(b3_adr), .m_dat_o(b3_d_m2s), .m_dat_i(b3_d_s2m), .m_we_o(b3_we), .m_stb_o(b3_stb), .m_cyc_o(b3_cyc), .m_ack_i(b3_ack)
+    );
+    ip_controller #(.BASE_ADDR(20'h00300), .MAX_WORDS(16'd64)) slave_ctrl_3 (
+        .clk(clk_dma_150), .rst(rst_i | soft_rst_ip3), .cpu_trigger_i(t3), .cpu_done_o(d3),.sys_clk_en_i(ce_ip3), 
+        .m_cyc_o(m3_cyc), .m_stb_o(m3_stb), .m_we_o(m3_we), .m_adr_o(m3_adr), .m_dat_o(m3_dat_c2m), .m_ack_i(m3_ack), 
+        .s_cyc_i(b3_cyc), .s_stb_i(b3_stb), .s_we_i(b3_we), .s_adr_i(b3_adr), .s_dat_i(b3_d_m2s), .s_dat_o(b3_d_s2m), .s_ack_o(b3_ack)
+    );
+
+    programmable_interrupt_controller #(.DATA_W(DATA_W)) pic (
+        .clk(clk_cpu_200), .rst(rst_i), .ip_irq_i({d3, d2, d1}), .cpu_intr_o(intr_cpu),
+        .wb_adr_i(s1_adr[15:0]), .wb_dat_i(s1_dat_o), .wb_dat_o(s1_dat_i), .wb_we_i(s1_we), .wb_stb_i(s1_stb), .wb_cyc_i(s1_cyc), .wb_ack_o(s1_ack)
+    );
+endmodule
+
+
+// ============================================================================
+// NEW MODULE A: CDC Pointer Synchronizer (2-Stage)
+// ============================================================================
+module pointer_sync #(parameter ADDR_W = 4)(
+    input  wire              clk,
+    input  wire              rst,
+    input  wire [ADDR_W:0]   ptr_in,
+    output reg  [ADDR_W:0]   ptr_out
+);
+    reg [ADDR_W:0] sync1;
+    always @(posedge clk) begin
+        if (rst) begin
+            sync1   <= 0;
+            ptr_out <= 0;
+        end else begin
+            sync1   <= ptr_in;
+            ptr_out <= sync1;
+        end
+    end
+endmodule
+
+// ============================================================================
+// MODULE 10: System Controller (SYSCON / PMU) - Reset & Clock Manager
+// ============================================================================
+module system_controller #(parameter DATA_W = 16)(
+    input  wire clk, rst,
+    input  wire [15:0] wb_adr_i, input wire [DATA_W-1:0] wb_dat_i, output reg [DATA_W-1:0] wb_dat_o,
+    input  wire wb_we_i, wb_stb_i, wb_cyc_i, output reg wb_ack_o,
+    output reg  ip1_rst_o, output reg ip2_rst_o, output reg ip3_rst_o,
+    output reg  ip1_ce_o,  output reg ip2_ce_o,  output reg ip3_ce_o // NEW: Clock Enables
+);
+    always @(posedge clk) begin
+        if (rst) begin
+            ip1_rst_o <= 1'b0; ip2_rst_o <= 1'b0; ip3_rst_o <= 1'b0;
+            ip1_ce_o  <= 1'b1; ip2_ce_o  <= 1'b1; ip3_ce_o  <= 1'b1; // Clocks default ON
+            wb_ack_o <= 1'b0; wb_dat_o <= 16'h0;
+        end else begin
+            ip1_rst_o <= 1'b0; ip2_rst_o <= 1'b0; ip3_rst_o <= 1'b0; // Resets are 1-cycle pulses
+            wb_ack_o <= 1'b0;
+            
+            if (wb_cyc_i && wb_stb_i && !wb_ack_o) begin
+                wb_ack_o <= 1'b1;
+                if (wb_we_i) begin
+                    if (wb_adr_i[3:0] == 4'h0) begin
+                        ip1_rst_o <= wb_dat_i[0]; 
+                        ip2_rst_o <= wb_dat_i[1]; 
+                        ip3_rst_o <= wb_dat_i[2]; 
+                    end
+                    else if (wb_adr_i[3:0] == 4'h1) begin // Offset 0x1: Clock Enable Reg
+                        ip1_ce_o <= wb_dat_i[0]; 
+                        ip2_ce_o <= wb_dat_i[1]; 
+                        ip3_ce_o <= wb_dat_i[2]; 
+                    end
+                end else begin
+                    if (wb_adr_i[3:0] == 4'h1) wb_dat_o <= {13'h0, ip3_ce_o, ip2_ce_o, ip1_ce_o};
+                    else wb_dat_o <= 16'h0;
+                end
+            end
+        end
+    end
+endmodule
+
+
+// ============================================================================
+// MODULE 2: Translation Lookaside Buffer (TLB)
+// ============================================================================
+module tlb_array #(parameter V_TAG_W = 12, parameter P_TAG_W = 16, parameter ENTRIES = 8)(
+    input  wire               clk, rst, req,
+    input  wire [V_TAG_W-1:0] v_tag, output reg  [P_TAG_W-1:0] p_tag, output reg hit, miss,
+    input  wire               wr_en, input  wire [V_TAG_W-1:0] wr_v_tag, input  wire [P_TAG_W-1:0] wr_p_tag
+);
+    reg [V_TAG_W-1:0] v_array [0:ENTRIES-1];
+    reg [P_TAG_W-1:0] p_array [0:ENTRIES-1];
+    reg               valid   [0:ENTRIES-1];
+    reg [2:0]         replace_ptr;
+    integer i;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            replace_ptr <= 3'b000;
+            for (i = 0; i < ENTRIES; i = i + 1) valid[i] <= 1'b0;
+        end else if (wr_en) begin
+            valid[replace_ptr]   <= 1'b1;
+            v_array[replace_ptr] <= wr_v_tag;
+            p_array[replace_ptr] <= wr_p_tag;
+            replace_ptr <= replace_ptr + 3'b001;
+        end
+    end
+
+    always @(*) begin
+        hit = 1'b0; miss = 1'b0; p_tag = {P_TAG_W{1'b0}};
+        if (req) begin
+            miss = 1'b1;
+            for (i = 0; i < ENTRIES; i = i + 1) begin
+                if (valid[i] && (v_array[i] == v_tag)) begin
+                    hit = 1'b1; miss = 1'b0; p_tag = p_array[i];
+                end
+            end
+        end
+    end
+endmodule
+
+
+
