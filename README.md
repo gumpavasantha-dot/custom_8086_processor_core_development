@@ -1,6 +1,22 @@
-# Custom 8086 Processor Core Development
+## Verification Status
 
-This repository contains Verilog HDL source text supplied for a custom 8086 processor-core / SoC design. The files have been organized from the supplied `my_project.txt` by extracting blocks that have both a `module` declaration and an `endmodule` marker. The original text is preserved in `original_source/my_project.txt`.
+**The 8086 processor core design has been verified using Synopsys tools and works as expected in the tested environment.**
+
+The repository contains Verilog HDL source files for the custom 8086 processor core and its related hardware modules. The source files are organized for review and further development.
+
+## Project Highlights
+
+- Designed using Verilog HDL.
+- Includes processor-related modules such as the ALU, Bus Interface Unit (BIU), cache, and other supporting components.
+- Verified using Synopsys tools.
+- Organized source code for further development and maintenance.
+
+## Future Improvements
+
+1. Continue reviewing and maintaining the Verilog source modules.
+2. Improve documentation for module functionality and interconnections.
+3. Further develop and optimize the processor core design.
+4. Maintain the source files and project documentation in GitHub.
 
 ## Included source modules
 
@@ -41,3 +57,14 @@ The exact list depends on which complete module blocks were present in the sourc
 ## Language
 
 Verilog HDL
+
+## TOOL
+Synopsys Verdi, VCS
+
+## Technologies
+
+Verilog HDL
+
+Synopsys EDA tools
+
+Digital design and processor architecture
