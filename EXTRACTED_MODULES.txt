@@ -1,0 +1,19 @@
+Extracted module blocks from supplied my_project.txt (no logic edits made):
+
+- alu: 16 lines
+- bus_interface_unit: 159 lines
+- l1_cache: 60 lines
+- wishbone_cdc_bridge: 52 lines
+- custom_8086_core: 28 lines
+- execution_unit: 150 lines
+- icg_cell: 14 lines
+- wishbone_interconnect: 54 lines
+- ip_controller: 77 lines
+- itcm: 4 lines
+- dual_clock_main_memory: 35 lines
+- programmable_interrupt_controller: 40 lines
+- prefetch_queue: 19 lines
+- soc_top: 92 lines
+- pointer_sync: 17 lines
+- system_controller: 37 lines
+- tlb_array: 35 lines
